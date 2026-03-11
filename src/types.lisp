@@ -1,3 +1,6 @@
+;;;; Copyright (c) 2024-2026 Parkian Company LLC. All rights reserved.
+;;;; SPDX-License-Identifier: BSD-3-Clause
+
 ;;;; types.lisp - Rate Limiting Types and Configurations
 ;;;;
 ;;;; Purpose: Defines fundamental types, structures, and configuration parameters

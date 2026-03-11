@@ -5,7 +5,7 @@
 
 (asdf:defsystem #:cl-ddos-protection
   :description "Rate limiting, ban scoring, and DoS protection mechanisms"
-  :author "CLPIC Contributors"
+  :author "Parkian Company LLC"
   :license "BSD-3-Clause"
   :version "1.0.0"
   :serial t
