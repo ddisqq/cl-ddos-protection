@@ -9,7 +9,7 @@
 (asdf:defsystem #:cl-ddos-protection
   :description "Rate limiting, ban scoring, and DoS protection mechanisms"
   :author "Parkian Company LLC"
-  :license "BSD-3-Clause"
+  :license "Apache-2.0"
   :version "0.1.0"
   :serial t
   :depends-on ()
