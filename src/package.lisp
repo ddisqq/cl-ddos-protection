@@ -44,7 +44,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; TYPES AND CONFIGURATION EXPORTS
   ;; ============================================================================
   (:export
-   ;; Rate limiter configuration
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Rate limiter configuration
    #:rate-limit-config
    #:make-rate-limit-config
    #:rate-limit-config-p
@@ -113,7 +115,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; TOKEN BUCKET EXPORTS
   ;; ============================================================================
   (:export
-   ;; Token bucket structure
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Token bucket structure
    #:token-bucket
    #:make-token-bucket
    #:token-bucket-p
@@ -152,7 +156,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; LEAKY BUCKET EXPORTS
   ;; ============================================================================
   (:export
-   ;; Leaky bucket structure
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Leaky bucket structure
    #:leaky-bucket
    #:make-leaky-bucket
    #:leaky-bucket-p
@@ -189,7 +195,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; SLIDING WINDOW EXPORTS
   ;; ============================================================================
   (:export
-   ;; Sliding window structure
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Sliding window structure
    #:sliding-window
    #:make-sliding-window
    #:sliding-window-p
@@ -232,7 +240,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; ADAPTIVE RATE LIMITING EXPORTS
   ;; ============================================================================
   (:export
-   ;; Adaptive limiter structure
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Adaptive limiter structure
    #:adaptive-limiter
    #:make-adaptive-limiter
    #:adaptive-limiter-p
@@ -285,7 +295,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; MESSAGE RATE LIMITS EXPORTS
   ;; ============================================================================
   (:export
-   ;; Per-message-type rate limiting
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Per-message-type rate limiting
    #:message-type-limit
    #:make-message-type-limit
    #:message-type-limit-p
@@ -317,7 +329,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; DDOS DETECTION EXPORTS
   ;; ============================================================================
   (:export
-   ;; Attack detection
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Attack detection
    #:ddos-detector
    #:make-ddos-detector
    #:ddos-detector-p
@@ -382,7 +396,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; IP REPUTATION EXPORTS
   ;; ============================================================================
   (:export
-   ;; IP reputation entry
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; IP reputation entry
    #:ip-reputation
    #:make-ip-reputation
    #:ip-reputation-p
@@ -445,7 +461,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; CIRCUIT BREAKER EXPORTS
   ;; ============================================================================
   (:export
-   ;; Circuit breaker structure
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Circuit breaker structure
    #:circuit-breaker
    #:make-circuit-breaker
    #:circuit-breaker-p
@@ -504,7 +522,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; THROTTLING EXPORTS
   ;; ============================================================================
   (:export
-   ;; Throttler structure
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Throttler structure
    #:throttler
    #:make-throttler
    #:throttler-p
@@ -563,7 +583,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; BAN MANAGER EXPORTS
   ;; ============================================================================
   (:export
-   ;; Ban entry
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Ban entry
    #:ban-entry
    #:make-ban-entry
    #:ban-entry-p
@@ -631,7 +653,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; METRICS EXPORTS
   ;; ============================================================================
   (:export
-   ;; Metrics collector
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Metrics collector
    #:metrics-collector
    #:make-metrics-collector
    #:metrics-collector-p
@@ -718,7 +742,9 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; UNIFIED PROTECTION SYSTEM EXPORTS
   ;; ============================================================================
   (:export
-   ;; Protection engine
+   #:with-ddos-protection-timing
+   #:ddos-protection-batch-process
+   #:ddos-protection-health-check;; Protection engine
    #:protection-engine
    #:make-protection-engine
    #:protection-engine-p
