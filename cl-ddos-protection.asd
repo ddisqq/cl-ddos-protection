@@ -8,15 +8,17 @@
 
 (asdf:defsystem #:cl-ddos-protection
   :description "Rate limiting, ban scoring, and DoS protection mechanisms"
-  :author "Parkian Company LLC"
+  :author "Park Ian Co"
   :license "Apache-2.0"
   :version "0.1.0"
   :serial t
   :depends-on ()
   :components ((:file "package")
                (:module "src"
-                :serial t
-                :components ((:file "types")))))
+                :components ((:file "package")
+                             (:file "conditions" :depends-on ("package"))
+                             (:file "types" :depends-on ("package"))
+                             (:file "cl-ddos-protection" :depends-on ("package" "conditions" "types")))))))
 
 (asdf:defsystem #:cl-ddos-protection/test
   :description "Tests for cl-ddos-protection"
