@@ -44,7 +44,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; TYPES AND CONFIGURATION EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Rate limiter configuration
    #:rate-limit-config
@@ -115,7 +119,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; TOKEN BUCKET EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Token bucket structure
    #:token-bucket
@@ -156,7 +164,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; LEAKY BUCKET EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Leaky bucket structure
    #:leaky-bucket
@@ -195,7 +207,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; SLIDING WINDOW EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Sliding window structure
    #:sliding-window
@@ -240,7 +256,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; ADAPTIVE RATE LIMITING EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Adaptive limiter structure
    #:adaptive-limiter
@@ -295,7 +315,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; MESSAGE RATE LIMITS EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Per-message-type rate limiting
    #:message-type-limit
@@ -329,7 +353,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; DDOS DETECTION EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Attack detection
    #:ddos-detector
@@ -396,7 +424,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; IP REPUTATION EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; IP reputation entry
    #:ip-reputation
@@ -461,7 +493,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; CIRCUIT BREAKER EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Circuit breaker structure
    #:circuit-breaker
@@ -522,7 +558,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; THROTTLING EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Throttler structure
    #:throttler
@@ -583,7 +623,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; BAN MANAGER EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Ban entry
    #:ban-entry
@@ -653,7 +697,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; METRICS EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Metrics collector
    #:metrics-collector
@@ -742,7 +790,11 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; UNIFIED PROTECTION SYSTEM EXPORTS
   ;; ============================================================================
   (:export
-   #:with-ddos-protection-timing
+   #:identity-list
+   #:flatten
+   #:map-keys
+   #:now-timestamp
+#:with-ddos-protection-timing
    #:ddos-protection-batch-process
    #:ddos-protection-health-check;; Protection engine
    #:protection-engine
