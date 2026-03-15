@@ -44,6 +44,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; TYPES AND CONFIGURATION EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -119,6 +121,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; TOKEN BUCKET EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -164,6 +168,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; LEAKY BUCKET EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -207,6 +213,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; SLIDING WINDOW EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -256,6 +264,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; ADAPTIVE RATE LIMITING EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -315,6 +325,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; MESSAGE RATE LIMITS EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -353,6 +365,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; DDOS DETECTION EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -424,6 +438,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; IP REPUTATION EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -493,6 +509,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; CIRCUIT BREAKER EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -558,6 +576,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; THROTTLING EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -623,6 +643,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; BAN MANAGER EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -697,6 +719,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; METRICS EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
@@ -790,6 +814,8 @@ All implementations are thread-safe and optimized for high-throughput networks."
   ;; UNIFIED PROTECTION SYSTEM EXPORTS
   ;; ============================================================================
   (:export
+   #:deep-copy-list
+   #:group-by-count
    #:identity-list
    #:flatten
    #:map-keys
