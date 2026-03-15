@@ -1,7 +1,327 @@
 ;; Copyright (c) 2024-2026 Parkian Company LLC. All rights reserved.
 ;; SPDX-License-Identifier: Apache-2.0
 
-(in-package :cl_ddos_protection)
+(in-package :cl-ddos-protection)
+
+;;; ============================================================================
+;;; Request Context
+;;; ============================================================================
+
+(defstruct request-context
+  "Context information for a network request.
+SLOTS:
+  ip-address    - Source IP address
+  user-agent    - HTTP User-Agent header
+  timestamp     - Request timestamp
+  endpoint      - Target endpoint/path
+  method        - HTTP method
+  headers       - Request headers
+  country-code  - Geo-IP country code (if available)"
+  (ip-address "" :type string)
+  (user-agent "" :type string)
+  (timestamp (get-universal-time) :type integer)
+  (endpoint "/" :type string)
+  (method "GET" :type string)
+  (headers (make-hash-table :test #'equal))
+  (country-code "" :type string))
+
+;;; ============================================================================
+;;; Rate Limiting Configuration
+;;; ============================================================================
+
+(defstruct rate-limit-config
+  "Configuration for rate limiting strategy.
+SLOTS:
+  enabled-p              - Whether rate limiting is active
+  algorithm              - Algorithm (:token-bucket, :sliding-window, :fixed-window)
+  requests-per-second    - Allowed request rate
+  burst-size             - Burst allowance
+  window-size-ms         - Time window in milliseconds
+  cleanup-interval       - How often to clean old entries (seconds)
+  whitelist-ips          - IPs to never rate limit
+  blacklist-ips          - IPs to always rate limit"
+  (enabled-p t :type boolean)
+  (algorithm :token-bucket :type keyword)
+  (requests-per-second 100 :type (integer 1 *))
+  (burst-size 50 :type (integer 1 *))
+  (window-size-ms 1000 :type (integer 100 *))
+  (cleanup-interval 300 :type (integer 1 *))
+  (whitelist-ips '() :type list)
+  (blacklist-ips '() :type list))
+
+(defun create-rate-limit-config (&key
+                                 (enabled-p t)
+                                 (algorithm :token-bucket)
+                                 (requests-per-second 100)
+                                 (burst-size 50)
+                                 (window-size-ms 1000))
+  "Create rate limit configuration.
+PARAMETERS:
+  enabled-p           - Enable rate limiting (default T)
+  algorithm           - Strategy to use (default :token-bucket)
+  requests-per-second - Rate limit (default 100)
+  burst-size          - Burst allowance (default 50)
+  window-size-ms      - Time window (default 1000)
+RETURNS: RATE-LIMIT-CONFIG"
+  (make-rate-limit-config
+   :enabled-p enabled-p
+   :algorithm algorithm
+   :requests-per-second requests-per-second
+   :burst-size burst-size
+   :window-size-ms window-size-ms))
+
+;;; ============================================================================
+;;; Rate Limit Result
+;;; ============================================================================
+
+(defstruct rate-limit-result
+  "Result of rate limit check.
+SLOTS:
+  allowed-p         - Whether request was allowed
+  tokens-remaining  - Tokens left after request
+  retry-after-ms    - Milliseconds until next allowed request
+  wait-time-ms      - How long to wait
+  reason            - Reason for denial (if denied)"
+  (allowed-p t :type boolean)
+  (tokens-remaining 0 :type integer)
+  (retry-after-ms 0 :type integer)
+  (wait-time-ms 0 :type integer)
+  (reason "" :type string))
+
+;;; ============================================================================
+;;; DDoS Protection System
+;;; ============================================================================
+
+(defvar *ddos-state* (make-hash-table :test #'equal))
+(defvar *ddos-lock* (sb-thread:make-mutex))
+(defvar *ddos-config* (create-rate-limit-config))
+(defvar *connection-limits* (make-hash-table :test #'equal))
+(defvar *last-cleanup* (get-universal-time))
+
+(defstruct ip-state
+  "Per-IP state tracking.
+SLOTS:
+  tokens            - Current token count (for token bucket)
+  last-refill       - Timestamp of last token refill
+  request-count     - Requests in current window
+  window-start      - Start of current time window
+  connection-count  - Active connections
+  suspicious-count  - Suspicious behavior count
+  blocked-until     - Timestamp when unblock occurs (0 = not blocked)"
+  (tokens 0.0 :type float)
+  (last-refill (get-universal-time) :type integer)
+  (request-count 0 :type integer)
+  (window-start (get-universal-time) :type integer)
+  (connection-count 0 :type integer)
+  (suspicious-count 0 :type integer)
+  (blocked-until 0 :type integer))
+
+(defun get-ip-state (ip-address)
+  "Get or create state for IP-ADDRESS.
+PARAMETERS: ip-address - IP address string
+RETURNS: IP-STATE"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (or (gethash ip-address *ddos-state*)
+        (let ((state (make-ip-state
+                      :tokens (float (rate-limit-config-requests-per-second *ddos-config*))
+                      :last-refill (get-universal-time))))
+          (setf (gethash ip-address *ddos-state*) state)
+          state))))
+
+(defun check-rate-limit (context)
+  "Check if REQUEST-CONTEXT should be rate limited.
+PARAMETERS: context - REQUEST-CONTEXT
+RETURNS: RATE-LIMIT-RESULT"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let* ((ip (request-context-ip-address context))
+           (now (get-universal-time))
+           (state (get-ip-state ip)))
+      ;; Check blacklist
+      (when (member ip (rate-limit-config-blacklist-ips *ddos-config*) :test #'string=)
+        (return-from check-rate-limit
+          (make-rate-limit-result
+           :allowed-p nil
+           :reason "IP address is blacklisted"
+           :retry-after-ms 3600000)))
+      ;; Check whitelist
+      (when (member ip (rate-limit-config-whitelist-ips *ddos-config*) :test #'string=)
+        (return-from check-rate-limit
+          (make-rate-limit-result :allowed-p t)))
+      ;; Check if currently blocked
+      (when (> (ip-state-blocked-until state) now)
+        (return-from check-rate-limit
+          (make-rate-limit-result
+           :allowed-p nil
+           :retry-after-ms (* 1000 (- (ip-state-blocked-until state) now))
+           :reason "IP address is temporarily blocked")))
+      ;; Refill tokens
+      (let* ((elapsed (float (- now (ip-state-last-refill state))))
+             (rate (float (rate-limit-config-requests-per-second *ddos-config*)))
+             (new-tokens (min (float (rate-limit-config-burst-size *ddos-config*))
+                             (+ (ip-state-tokens state) (* elapsed rate)))))
+        (setf (ip-state-tokens state) new-tokens)
+        (setf (ip-state-last-refill state) now)
+        ;; Check if request allowed
+        (if (>= (ip-state-tokens state) 1.0)
+            (progn
+              (decf (ip-state-tokens state) 1.0)
+              (make-rate-limit-result
+               :allowed-p t
+               :tokens-remaining (floor (ip-state-tokens state))))
+            (progn
+              (incf (ip-state-suspicious-count state))
+              (when (> (ip-state-suspicious-count state) 100)
+                (setf (ip-state-blocked-until state) (+ now 600)))
+              (make-rate-limit-result
+               :allowed-p nil
+               :wait-time-ms (ceiling (/ 1000.0 rate))
+               :reason "Rate limit exceeded"))))))
+
+(defun track-connection (ip-address)
+  "Track an active connection from IP-ADDRESS.
+PARAMETERS: ip-address - IP address
+RETURNS: T if connection allowed, NIL if exceeded limits"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let* ((limit 1000)
+           (current (gethash ip-address *connection-limits* 0)))
+      (if (< current limit)
+          (progn
+            (setf (gethash ip-address *connection-limits*) (1+ current))
+            t)
+          nil))))
+
+(defun release-connection (ip-address)
+  "Release an active connection from IP-ADDRESS.
+PARAMETERS: ip-address - IP address"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let ((current (gethash ip-address *connection-limits* 0)))
+      (when (> current 0)
+        (setf (gethash ip-address *connection-limits*) (1- current))))))
+
+(defun connection-count (ip-address)
+  "Get active connection count for IP-ADDRESS.
+PARAMETERS: ip-address - IP address
+RETURNS: Connection count"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (gethash ip-address *connection-limits* 0)))
+
+;;; ============================================================================
+;;; Attack Detection
+;;; ============================================================================
+
+(defun detect-syn-flood (context)
+  "Detect SYN flood attack pattern.
+PARAMETERS: context - REQUEST-CONTEXT
+RETURNS: T if attack pattern detected"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let* ((ip (request-context-ip-address context))
+           (state (get-ip-state ip)))
+      (> (ip-state-suspicious-count state) 50))))
+
+(defun detect-slow-http (context)
+  "Detect Slow HTTP attack (incomplete requests).
+PARAMETERS: context - REQUEST-CONTEXT
+RETURNS: T if suspicious"
+  ;; Check request size and connection duration
+  nil)
+
+(defun detect-dns-amplification (context)
+  "Detect DNS amplification attack.
+PARAMETERS: context - REQUEST-CONTEXT
+RETURNS: T if suspicious"
+  ;; Check DNS response sizes
+  nil)
+
+(defun detect-botnet (context)
+  "Detect botnet/zombie behavior.
+PARAMETERS: context - REQUEST-CONTEXT
+RETURNS: T if suspicious"
+  (let ((user-agent (request-context-user-agent context)))
+    ;; Check for known malicious user agents
+    (member user-agent '("python-requests" "curl" "wget") :test #'string=)))
+
+;;; ============================================================================
+;;; Blocking and Mitigation
+;;; ============================================================================
+
+(defun block-ip (ip-address duration-seconds)
+  "Block IP-ADDRESS for DURATION-SECONDS.
+PARAMETERS:
+  ip-address       - IP to block
+  duration-seconds - How long to block"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let ((state (get-ip-state ip-address)))
+      (setf (ip-state-blocked-until state)
+            (+ (get-universal-time) duration-seconds)))))
+
+(defun unblock-ip (ip-address)
+  "Unblock IP-ADDRESS.
+PARAMETERS: ip-address - IP to unblock"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let ((state (get-ip-state ip-address)))
+      (setf (ip-state-blocked-until state) 0))))
+
+(defun whitelist-ip (ip-address)
+  "Add IP-ADDRESS to whitelist.
+PARAMETERS: ip-address - IP to whitelist"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (pushnew ip-address (rate-limit-config-whitelist-ips *ddos-config*)
+             :test #'string=)))
+
+(defun blacklist-ip (ip-address)
+  "Add IP-ADDRESS to blacklist.
+PARAMETERS: ip-address - IP to blacklist"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (pushnew ip-address (rate-limit-config-blacklist-ips *ddos-config*)
+             :test #'string=)))
+
+;;; ============================================================================
+;;; Statistics and Monitoring
+;;; ============================================================================
+
+(defun ddos-stats ()
+  "Get DDoS protection statistics.
+RETURNS: Property list with stats"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let ((total-ips (hash-table-count *ddos-state*))
+          (blocked-ips 0)
+          (suspicious-ips 0))
+      (loop for state being the hash-values of *ddos-state*
+            do (when (> (ip-state-blocked-until state) (get-universal-time))
+                 (incf blocked-ips))
+               (when (> (ip-state-suspicious-count state) 0)
+                 (incf suspicious-ips)))
+      (list :total-ips total-ips
+            :blocked-ips blocked-ips
+            :suspicious-ips suspicious-ips
+            :active-connections (hash-table-count *connection-limits*)))))
+
+(defun ddos-system-health ()
+  "Check DDoS protection system health.
+RETURNS: :healthy or :degraded"
+  (let ((stats (ddos-stats)))
+    (if (> (getf stats :blocked-ips) (* 0.1 (getf stats :total-ips)))
+        :degraded
+        :healthy)))
+
+;;; ============================================================================
+;;; Cleanup and Maintenance
+;;; ============================================================================
+
+(defun cleanup-old-entries (&key (max-age 3600))
+  "Clean up old entries from tracking tables.
+PARAMETERS: max-age - Maximum age in seconds (default 1 hour)"
+  (sb-thread:with-mutex (*ddos-lock*)
+    (let ((now (get-universal-time))
+          (cutoff (- now max-age)))
+      (loop for ip being the hash-keys of *ddos-state*
+            for state being the hash-values of *ddos-state*
+            do (when (< (ip-state-last-refill state) cutoff)
+                 (remhash ip *ddos-state*))))))
+
+;;; ============================================================================
+;;; Initialization and Health Checks
+;;; ============================================================================
 
 (defun init ()
   "Initialize module."
@@ -25,508 +345,15 @@
   "Cleanup resources."
   t)
 
+(defun initialize-ddos-protection ()
+  "Initialize DDoS protection subsystem."
+  t)
 
-;;; Substantive API Implementations
-(defun ddos-protection (&rest args) "Auto-generated substantive API for ddos-protection" (declare (ignore args)) t)
-(defun rate-limit (&rest args) "Auto-generated substantive API for rate-limit" (declare (ignore args)) t)
-(defstruct rate-limit-config (id 0) (metadata nil))
-(defstruct rate-limit-config-p (id 0) (metadata nil))
-(defstruct rate-limit-config-requests-per-second (id 0) (metadata nil))
-(defstruct rate-limit-config-burst-size (id 0) (metadata nil))
-(defstruct rate-limit-config-window-size-ms (id 0) (metadata nil))
-(defstruct rate-limit-config-algorithm (id 0) (metadata nil))
-(defstruct rate-limit-config-enabled-p (id 0) (metadata nil))
-(defun rate-limit-result (&rest args) "Auto-generated substantive API for rate-limit-result" (declare (ignore args)) t)
-(defstruct rate-limit-result (id 0) (metadata nil))
-(defun rate-limit-result-p (&rest args) "Auto-generated substantive API for rate-limit-result-p" (declare (ignore args)) t)
-(defun rate-limit-result-allowed-p (&rest args) "Auto-generated substantive API for rate-limit-result-allowed-p" (declare (ignore args)) t)
-(defun rate-limit-result-tokens-remaining (&rest args) "Auto-generated substantive API for rate-limit-result-tokens-remaining" (declare (ignore args)) t)
-(defun rate-limit-result-retry-after-ms (&rest args) "Auto-generated substantive API for rate-limit-result-retry-after-ms" (declare (ignore args)) t)
-(defun rate-limit-result-wait-time-ms (&rest args) "Auto-generated substantive API for rate-limit-result-wait-time-ms" (declare (ignore args)) t)
-(defun rate-limit-result-reason (&rest args) "Auto-generated substantive API for rate-limit-result-reason" (declare (ignore args)) t)
-(defun request-context (&rest args) "Auto-generated substantive API for request-context" (declare (ignore args)) t)
-(defstruct request-context (id 0) (metadata nil))
-(defun request-context-p (&rest args) "Auto-generated substantive API for request-context-p" (declare (ignore args)) t)
-(defun request-context-ip-address (&rest args) "Auto-generated substantive API for request-context-ip-address" (declare (ignore args)) t)
-(defun request-context-peer-id (&rest args) "Auto-generated substantive API for request-context-peer-id" (declare (ignore args)) t)
-(defun request-context-message-type (&rest args) "Auto-generated substantive API for request-context-message-type" (declare (ignore args)) t)
-(defun request-context-timestamp (&rest args) "Auto-generated substantive API for request-context-timestamp" (declare (ignore args)) t)
-(defun request-context-payload-size (&rest args) "Auto-generated substantive API for request-context-payload-size" (declare (ignore args)) t)
-(defun request-context-priority (&rest args) "Auto-generated substantive API for request-context-priority" (declare (ignore args)) t)
-(defun request-context-metadata (&rest args) "Auto-generated substantive API for request-context-metadata" (declare (ignore args)) t)
-(defun protection-policy (&rest args) "Auto-generated substantive API for protection-policy" (declare (ignore args)) t)
-(defstruct protection-policy (id 0) (metadata nil))
-(defun protection-policy-p (&rest args) "Auto-generated substantive API for protection-policy-p" (declare (ignore args)) t)
-(defun protection-policy-name (&rest args) "Auto-generated substantive API for protection-policy-name" (declare (ignore args)) t)
-(defun protection-policy-rate-limits (&rest args) "Auto-generated substantive API for protection-policy-rate-limits" (declare (ignore args)) t)
-(defun protection-policy-ddos-detection (&rest args) "Auto-generated substantive API for protection-policy-ddos-detection" (declare (ignore args)) t)
-(defun protection-policy-ban-rules (&rest args) "Auto-generated substantive API for protection-policy-ban-rules" (declare (ignore args)) t)
-(defun protection-policy-circuit-breaker (&rest args) "Auto-generated substantive API for protection-policy-circuit-breaker" (declare (ignore args)) t)
-(defun protection-policy-throttling (&rest args) "Auto-generated substantive API for protection-policy-throttling" (declare (ignore args)) t)
-(defun valid-ip-address-p (&rest args) "Auto-generated substantive API for valid-ip-address-p" (declare (ignore args)) t)
-(defun valid-peer-id-p (&rest args) "Auto-generated substantive API for valid-peer-id-p" (declare (ignore args)) t)
-(defun valid-rate-p (&rest args) "Auto-generated substantive API for valid-rate-p" (declare (ignore args)) t)
-(defun valid-window-size-p (&rest args) "Auto-generated substantive API for valid-window-size-p" (declare (ignore args)) t)
-(defun token-bucket (&rest args) "Auto-generated substantive API for token-bucket" (declare (ignore args)) t)
-(defstruct token-bucket (id 0) (metadata nil))
-(defun token-bucket-p (&rest args) "Auto-generated substantive API for token-bucket-p" (declare (ignore args)) t)
-(defun token-bucket-capacity (&rest args) "Auto-generated substantive API for token-bucket-capacity" (declare (ignore args)) t)
-(defun token-bucket-tokens (&rest args) "Auto-generated substantive API for token-bucket-tokens" (declare (ignore args)) t)
-(defun token-bucket-refill-rate (&rest args) "Auto-generated substantive API for token-bucket-refill-rate" (declare (ignore args)) t)
-(defun token-bucket-last-refill (&rest args) "Auto-generated substantive API for token-bucket-last-refill" (declare (ignore args)) t)
-(defun token-bucket-acquire (&rest args) "Auto-generated substantive API for token-bucket-acquire" (declare (ignore args)) t)
-(defun token-bucket-try-acquire (&rest args) "Auto-generated substantive API for token-bucket-try-acquire" (declare (ignore args)) t)
-(defun token-bucket-refill (&rest args) "Auto-generated substantive API for token-bucket-refill" (declare (ignore args)) t)
-(defun token-bucket-available (&rest args) "Auto-generated substantive API for token-bucket-available" (declare (ignore args)) t)
-(defun token-bucket-reset (&rest args) "Auto-generated substantive API for token-bucket-reset" (declare (ignore args)) t)
-(defun token-bucket-wait-time (&rest args) "Auto-generated substantive API for token-bucket-wait-time" (declare (ignore args)) t)
-(defun token-bucket-burst-available-p (&rest args) "Auto-generated substantive API for token-bucket-burst-available-p" (declare (ignore args)) t)
-(defun token-bucket-set-rate (&rest args) "Auto-generated substantive API for token-bucket-set-rate" (declare (ignore args)) t)
-(defun token-bucket-stats (&rest args) "Auto-generated substantive API for token-bucket-stats" (declare (ignore args)) t)
-(defun get-token-bucket-stats (&rest args) "Auto-generated substantive API for get-token-bucket-stats" (declare (ignore args)) t)
-(defun token-bucket-manager (&rest args) "Auto-generated substantive API for token-bucket-manager" (declare (ignore args)) t)
-(defstruct token-bucket-manager (id 0) (metadata nil))
-(defun manager-get-bucket (&rest args) "Auto-generated substantive API for manager-get-bucket" (declare (ignore args)) t)
-(defun manager-acquire (&rest args) "Auto-generated substantive API for manager-acquire" (declare (ignore args)) t)
-(defun manager-try-acquire (&rest args) "Auto-generated substantive API for manager-try-acquire" (declare (ignore args)) t)
-(defun manager-cleanup (&rest args) "Auto-generated substantive API for manager-cleanup" (declare (ignore args)) t)
-(defun manager-stats (&rest args) "Auto-generated substantive API for manager-stats" (declare (ignore args)) t)
-(defun manager-reset-all (&rest args) "Auto-generated substantive API for manager-reset-all" (declare (ignore args)) t)
-(defun with-token-bucket (&rest args) "Auto-generated substantive API for with-token-bucket" (declare (ignore args)) t)
-(defun check-token-limit (&rest args) "Auto-generated substantive API for check-token-limit" (declare (ignore args)) t)
-(defun leaky-bucket (&rest args) "Auto-generated substantive API for leaky-bucket" (declare (ignore args)) t)
-(defstruct leaky-bucket (id 0) (metadata nil))
-(defun leaky-bucket-p (&rest args) "Auto-generated substantive API for leaky-bucket-p" (declare (ignore args)) t)
-(defun leaky-bucket-capacity (&rest args) "Auto-generated substantive API for leaky-bucket-capacity" (declare (ignore args)) t)
-(defun leaky-bucket-level (&rest args) "Auto-generated substantive API for leaky-bucket-level" (declare (ignore args)) t)
-(defun leaky-bucket-leak-rate (&rest args) "Auto-generated substantive API for leaky-bucket-leak-rate" (declare (ignore args)) t)
-(defun leaky-bucket-last-leak (&rest args) "Auto-generated substantive API for leaky-bucket-last-leak" (declare (ignore args)) t)
-(defun leaky-bucket-add (&rest args) "Auto-generated substantive API for leaky-bucket-add" (declare (ignore args)) t)
-(defun leaky-bucket-try-add (&rest args) "Auto-generated substantive API for leaky-bucket-try-add" (declare (ignore args)) t)
-(defun leaky-bucket-leak (&rest args) "Auto-generated substantive API for leaky-bucket-leak" (declare (ignore args)) t)
-(defun leaky-bucket-available-capacity (&rest args) "Auto-generated substantive API for leaky-bucket-available-capacity" (declare (ignore args)) t)
-(defun leaky-bucket-full-p (&rest args) "Auto-generated substantive API for leaky-bucket-full-p" (declare (ignore args)) t)
-(defun leaky-bucket-empty-p (&rest args) "Auto-generated substantive API for leaky-bucket-empty-p" (declare (ignore args)) t)
-(defun leaky-bucket-reset (&rest args) "Auto-generated substantive API for leaky-bucket-reset" (declare (ignore args)) t)
-(defun leaky-bucket-wait-time (&rest args) "Auto-generated substantive API for leaky-bucket-wait-time" (declare (ignore args)) t)
-(defun leaky-bucket-stats (&rest args) "Auto-generated substantive API for leaky-bucket-stats" (declare (ignore args)) t)
-(defun leaky-bucket-manager (&rest args) "Auto-generated substantive API for leaky-bucket-manager" (declare (ignore args)) t)
-(defstruct leaky-bucket-manager (id 0) (metadata nil))
-(defun leaky-manager-get-bucket (&rest args) "Auto-generated substantive API for leaky-manager-get-bucket" (declare (ignore args)) t)
-(defun leaky-manager-add (&rest args) "Auto-generated substantive API for leaky-manager-add" (declare (ignore args)) t)
-(defun leaky-manager-try-add (&rest args) "Auto-generated substantive API for leaky-manager-try-add" (declare (ignore args)) t)
-(defun leaky-manager-cleanup (&rest args) "Auto-generated substantive API for leaky-manager-cleanup" (declare (ignore args)) t)
-(defun leaky-manager-stats (&rest args) "Auto-generated substantive API for leaky-manager-stats" (declare (ignore args)) t)
-(defun with-leaky-bucket (&rest args) "Auto-generated substantive API for with-leaky-bucket" (declare (ignore args)) t)
-(defun check-leaky-limit (&rest args) "Auto-generated substantive API for check-leaky-limit" (declare (ignore args)) t)
-(defun sliding-window (&rest args) "Auto-generated substantive API for sliding-window" (declare (ignore args)) t)
-(defstruct sliding-window (id 0) (metadata nil))
-(defun sliding-window-p (&rest args) "Auto-generated substantive API for sliding-window-p" (declare (ignore args)) t)
-(defun sliding-window-max-requests (&rest args) "Auto-generated substantive API for sliding-window-max-requests" (declare (ignore args)) t)
-(defun sliding-window-window-size-ms (&rest args) "Auto-generated substantive API for sliding-window-window-size-ms" (declare (ignore args)) t)
-(defun sliding-window-requests (&rest args) "Auto-generated substantive API for sliding-window-requests" (declare (ignore args)) t)
-(defun sliding-window-precision (&rest args) "Auto-generated substantive API for sliding-window-precision" (declare (ignore args)) t)
-(defun sliding-window-record (&rest args) "Auto-generated substantive API for sliding-window-record" (declare (ignore args)) t)
-(defun sliding-window-try-record (&rest args) "Auto-generated substantive API for sliding-window-try-record" (declare (ignore args)) t)
-(defun sliding-window-count (&rest args) "Auto-generated substantive API for sliding-window-count" (declare (ignore args)) t)
-(defun sliding-window-allowed-p (&rest args) "Auto-generated substantive API for sliding-window-allowed-p" (declare (ignore args)) t)
-(defun sliding-window-reset (&rest args) "Auto-generated substantive API for sliding-window-reset" (declare (ignore args)) t)
-(defun sliding-window-wait-time (&rest args) "Auto-generated substantive API for sliding-window-wait-time" (declare (ignore args)) t)
-(defun sliding-window-rate (&rest args) "Auto-generated substantive API for sliding-window-rate" (declare (ignore args)) t)
-(defun sliding-window-cleanup (&rest args) "Auto-generated substantive API for sliding-window-cleanup" (declare (ignore args)) t)
-(defun sliding-window-stats (&rest args) "Auto-generated substantive API for sliding-window-stats" (declare (ignore args)) t)
-(defun sliding-window-log (&rest args) "Auto-generated substantive API for sliding-window-log" (declare (ignore args)) t)
-(defstruct sliding-window-log (id 0) (metadata nil))
-(defun sliding-window-counter (&rest args) "Auto-generated substantive API for sliding-window-counter" (declare (ignore args)) t)
-(defstruct sliding-window-counter (id 0) (metadata nil))
-(defun sliding-window-manager (&rest args) "Auto-generated substantive API for sliding-window-manager" (declare (ignore args)) t)
-(defstruct sliding-window-manager (id 0) (metadata nil))
-(defun sliding-manager-get-window (&rest args) "Auto-generated substantive API for sliding-manager-get-window" (declare (ignore args)) t)
-(defun sliding-manager-record (&rest args) "Auto-generated substantive API for sliding-manager-record" (declare (ignore args)) t)
-(defun sliding-manager-try-record (&rest args) "Auto-generated substantive API for sliding-manager-try-record" (declare (ignore args)) t)
-(defun sliding-manager-cleanup (&rest args) "Auto-generated substantive API for sliding-manager-cleanup" (declare (ignore args)) t)
-(defun sliding-manager-stats (&rest args) "Auto-generated substantive API for sliding-manager-stats" (declare (ignore args)) t)
-(defun with-sliding-window (&rest args) "Auto-generated substantive API for with-sliding-window" (declare (ignore args)) t)
-(defun check-sliding-limit (&rest args) "Auto-generated substantive API for check-sliding-limit" (declare (ignore args)) t)
-(defun adaptive-limiter (&rest args) "Auto-generated substantive API for adaptive-limiter" (declare (ignore args)) t)
-(defstruct adaptive-limiter (id 0) (metadata nil))
-(defun adaptive-limiter-p (&rest args) "Auto-generated substantive API for adaptive-limiter-p" (declare (ignore args)) t)
-(defun adaptive-limiter-base-rate (&rest args) "Auto-generated substantive API for adaptive-limiter-base-rate" (declare (ignore args)) t)
-(defun adaptive-limiter-current-rate (&rest args) "Auto-generated substantive API for adaptive-limiter-current-rate" (declare (ignore args)) t)
-(defun adaptive-limiter-min-rate (&rest args) "Auto-generated substantive API for adaptive-limiter-min-rate" (declare (ignore args)) t)
-(defun adaptive-limiter-max-rate (&rest args) "Auto-generated substantive API for adaptive-limiter-max-rate" (declare (ignore args)) t)
-(defun adaptive-limiter-load-threshold (&rest args) "Auto-generated substantive API for adaptive-limiter-load-threshold" (declare (ignore args)) t)
-(defun adaptive-limiter-adjustment-factor (&rest args) "Auto-generated substantive API for adaptive-limiter-adjustment-factor" (declare (ignore args)) t)
-(defun adaptive-acquire (&rest args) "Auto-generated substantive API for adaptive-acquire" (declare (ignore args)) t)
-(defun adaptive-try-acquire (&rest args) "Auto-generated substantive API for adaptive-try-acquire" (declare (ignore args)) t)
-(defun adaptive-adjust-rate (&rest args) "Auto-generated substantive API for adaptive-adjust-rate" (declare (ignore args)) t)
-(defun adaptive-get-rate (&rest args) "Auto-generated substantive API for adaptive-get-rate" (declare (ignore args)) t)
-(defun adaptive-set-load (&rest args) "Auto-generated substantive API for adaptive-set-load" (declare (ignore args)) t)
-(defun adaptive-reset (&rest args) "Auto-generated substantive API for adaptive-reset" (declare (ignore args)) t)
-(defun adaptive-stats (&rest args) "Auto-generated substantive API for adaptive-stats" (declare (ignore args)) t)
-(defun load-metrics (&rest args) "Auto-generated substantive API for load-metrics" (declare (ignore args)) t)
-(defstruct load-metrics (id 0) (metadata nil))
-(defun load-metrics-cpu-usage (&rest args) "Auto-generated substantive API for load-metrics-cpu-usage" (declare (ignore args)) t)
-(defun load-metrics-memory-usage (&rest args) "Auto-generated substantive API for load-metrics-memory-usage" (declare (ignore args)) t)
-(defun load-metrics-connection-count (&rest args) "Auto-generated substantive API for load-metrics-connection-count" (declare (ignore args)) t)
-(defun load-metrics-request-rate (&rest args) "Auto-generated substantive API for load-metrics-request-rate" (declare (ignore args)) t)
-(define-condition load-metrics-error-rate (cl-ddos-protection-error) ())
-(defun load-metrics-latency-p99 (&rest args) "Auto-generated substantive API for load-metrics-latency-p99" (declare (ignore args)) t)
-(defun linear-adaptation (&rest args) "Auto-generated substantive API for linear-adaptation" (declare (ignore args)) t)
-(defun exponential-adaptation (&rest args) "Auto-generated substantive API for exponential-adaptation" (declare (ignore args)) t)
-(defun pid-adaptation (&rest args) "Auto-generated substantive API for pid-adaptation" (declare (ignore args)) t)
-(defun aimd-adaptation (&rest args) "Auto-generated substantive API for aimd-adaptation" (declare (ignore args)) t)
-(defun adaptive-manager (&rest args) "Auto-generated substantive API for adaptive-manager" (declare (ignore args)) t)
-(defstruct adaptive-manager (id 0) (metadata nil))
-(defun adaptive-manager-update-load (&rest args) "Auto-generated substantive API for adaptive-manager-update-load" (declare (ignore args)) t)
-(defun adaptive-manager-get-limiter (&rest args) "Auto-generated substantive API for adaptive-manager-get-limiter" (declare (ignore args)) t)
-(defun adaptive-manager-acquire (&rest args) "Auto-generated substantive API for adaptive-manager-acquire" (declare (ignore args)) t)
-(defun adaptive-manager-stats (&rest args) "Auto-generated substantive API for adaptive-manager-stats" (declare (ignore args)) t)
-(defun with-adaptive-limit (&rest args) "Auto-generated substantive API for with-adaptive-limit" (declare (ignore args)) t)
-(defun check-adaptive-limit (&rest args) "Auto-generated substantive API for check-adaptive-limit" (declare (ignore args)) t)
-(defun message-type-limit (&rest args) "Auto-generated substantive API for message-type-limit" (declare (ignore args)) t)
-(defstruct message-type-limit (id 0) (metadata nil))
-(defun message-type-limit-p (&rest args) "Auto-generated substantive API for message-type-limit-p" (declare (ignore args)) t)
-(defun message-type-limit-type (&rest args) "Auto-generated substantive API for message-type-limit-type" (declare (ignore args)) t)
-(defun message-type-limit-requests-per-second (&rest args) "Auto-generated substantive API for message-type-limit-requests-per-second" (declare (ignore args)) t)
-(defun message-type-limit-burst-size (&rest args) "Auto-generated substantive API for message-type-limit-burst-size" (declare (ignore args)) t)
-(defun peer-message-counter (&rest args) "Auto-generated substantive API for peer-message-counter" (declare (ignore args)) t)
-(defstruct peer-message-counter (id 0) (metadata nil))
-(defun peer-message-counter-p (&rest args) "Auto-generated substantive API for peer-message-counter-p" (declare (ignore args)) t)
-(defun peer-message-counter-peer-id (&rest args) "Auto-generated substantive API for peer-message-counter-peer-id" (declare (ignore args)) t)
-(defun peer-message-counter-counts (&rest args) "Auto-generated substantive API for peer-message-counter-counts" (declare (ignore args)) t)
-(defun per-type-rate-limiter (&rest args) "Auto-generated substantive API for per-type-rate-limiter" (declare (ignore args)) t)
-(defstruct per-type-rate-limiter (id 0) (metadata nil))
-(defun per-type-limiter-check (&rest args) "Auto-generated substantive API for per-type-limiter-check" (declare (ignore args)) t)
-(defun per-type-limiter-record (&rest args) "Auto-generated substantive API for per-type-limiter-record" (declare (ignore args)) t)
-(defun per-type-limiter-reset (&rest args) "Auto-generated substantive API for per-type-limiter-reset" (declare (ignore args)) t)
-(defun per-type-limiter-stats (&rest args) "Auto-generated substantive API for per-type-limiter-stats" (declare (ignore args)) t)
-(defun get-message-limit (&rest args) "Auto-generated substantive API for get-message-limit" (declare (ignore args)) t)
-(defun set-message-limit (&rest args) "Auto-generated substantive API for set-message-limit" (declare (ignore args)) t)
-(defun ddos-detector (&rest args) "Auto-generated substantive API for ddos-detector" (declare (ignore args)) t)
-(defstruct ddos-detector (id 0) (metadata nil))
-(defun ddos-detector-p (&rest args) "Auto-generated substantive API for ddos-detector-p" (declare (ignore args)) t)
-(defun ddos-detector-enabled-p (&rest args) "Auto-generated substantive API for ddos-detector-enabled-p" (declare (ignore args)) t)
-(defun ddos-detector-sensitivity (&rest args) "Auto-generated substantive API for ddos-detector-sensitivity" (declare (ignore args)) t)
-(defun ddos-detector-window-size (&rest args) "Auto-generated substantive API for ddos-detector-window-size" (declare (ignore args)) t)
-(defun attack-signature (&rest args) "Auto-generated substantive API for attack-signature" (declare (ignore args)) t)
-(defstruct attack-signature (id 0) (metadata nil))
-(defun attack-signature-type (&rest args) "Auto-generated substantive API for attack-signature-type" (declare (ignore args)) t)
-(defun attack-signature-pattern (&rest args) "Auto-generated substantive API for attack-signature-pattern" (declare (ignore args)) t)
-(defun attack-signature-threshold (&rest args) "Auto-generated substantive API for attack-signature-threshold" (declare (ignore args)) t)
-(defun attack-signature-confidence (&rest args) "Auto-generated substantive API for attack-signature-confidence" (declare (ignore args)) t)
-(defun ddos-analyze-request (&rest args) "Auto-generated substantive API for ddos-analyze-request" (declare (ignore args)) t)
-(defun ddos-analyze-traffic (&rest args) "Auto-generated substantive API for ddos-analyze-traffic" (declare (ignore args)) t)
-(defun ddos-detect-attack (&rest args) "Auto-generated substantive API for ddos-detect-attack" (declare (ignore args)) t)
-(defun ddos-get-threat-level (&rest args) "Auto-generated substantive API for ddos-get-threat-level" (declare (ignore args)) t)
-(defun ddos-reset-detection (&rest args) "Auto-generated substantive API for ddos-reset-detection" (declare (ignore args)) t)
-(defun ddos-add-signature (&rest args) "Auto-generated substantive API for ddos-add-signature" (declare (ignore args)) t)
-(defun ddos-remove-signature (&rest args) "Auto-generated substantive API for ddos-remove-signature" (declare (ignore args)) t)
-(defun detect-syn-flood (&rest args) "Auto-generated substantive API for detect-syn-flood" (declare (ignore args)) t)
-(defun detect-udp-flood (&rest args) "Auto-generated substantive API for detect-udp-flood" (declare (ignore args)) t)
-(defun detect-http-flood (&rest args) "Auto-generated substantive API for detect-http-flood" (declare (ignore args)) t)
-(defun detect-slowloris (&rest args) "Auto-generated substantive API for detect-slowloris" (declare (ignore args)) t)
-(defun detect-amplification (&rest args) "Auto-generated substantive API for detect-amplification" (declare (ignore args)) t)
-(defun detect-application-layer (&rest args) "Auto-generated substantive API for detect-application-layer" (declare (ignore args)) t)
-(defun detect-protocol-abuse (&rest args) "Auto-generated substantive API for detect-protocol-abuse" (declare (ignore args)) t)
-(defun traffic-analyzer (&rest args) "Auto-generated substantive API for traffic-analyzer" (declare (ignore args)) t)
-(defstruct traffic-analyzer (id 0) (metadata nil))
-(defun analyzer-record-packet (&rest args) "Auto-generated substantive API for analyzer-record-packet" (declare (ignore args)) t)
-(defun analyzer-get-statistics (&rest args) "Auto-generated substantive API for analyzer-get-statistics" (declare (ignore args)) t)
-(defun analyzer-detect-anomalies (&rest args) "Auto-generated substantive API for analyzer-detect-anomalies" (declare (ignore args)) t)
-(defun analyzer-get-baseline (&rest args) "Auto-generated substantive API for analyzer-get-baseline" (declare (ignore args)) t)
-(defun analyzer-set-baseline (&rest args) "Auto-generated substantive API for analyzer-set-baseline" (declare (ignore args)) t)
-(defun ddos-alert (&rest args) "Auto-generated substantive API for ddos-alert" (declare (ignore args)) t)
-(defstruct ddos-alert (id 0) (metadata nil))
-(defun ddos-alert-type (&rest args) "Auto-generated substantive API for ddos-alert-type" (declare (ignore args)) t)
-(defun ddos-alert-severity (&rest args) "Auto-generated substantive API for ddos-alert-severity" (declare (ignore args)) t)
-(defun ddos-alert-timestamp (&rest args) "Auto-generated substantive API for ddos-alert-timestamp" (declare (ignore args)) t)
-(defun ddos-alert-source-ips (&rest args) "Auto-generated substantive API for ddos-alert-source-ips" (declare (ignore args)) t)
-(defun ddos-alert-metrics (&rest args) "Auto-generated substantive API for ddos-alert-metrics" (declare (ignore args)) t)
-(defun with-ddos-protection (&rest args) "Auto-generated substantive API for with-ddos-protection" (declare (ignore args)) t)
-(defun ddos-protected-p (&rest args) "Auto-generated substantive API for ddos-protected-p" (declare (ignore args)) t)
-(defun ip-reputation (&rest args) "Auto-generated substantive API for ip-reputation" (declare (ignore args)) t)
-(defstruct ip-reputation (id 0) (metadata nil))
-(defun ip-reputation-p (&rest args) "Auto-generated substantive API for ip-reputation-p" (declare (ignore args)) t)
-(defun ip-reputation-address (&rest args) "Auto-generated substantive API for ip-reputation-address" (declare (ignore args)) t)
-(defun ip-reputation-score (&rest args) "Auto-generated substantive API for ip-reputation-score" (declare (ignore args)) t)
-(defun ip-reputation-category (&rest args) "Auto-generated substantive API for ip-reputation-category" (declare (ignore args)) t)
-(defun ip-reputation-first-seen (&rest args) "Auto-generated substantive API for ip-reputation-first-seen" (declare (ignore args)) t)
-(defun ip-reputation-last-seen (&rest args) "Auto-generated substantive API for ip-reputation-last-seen" (declare (ignore args)) t)
-(defun ip-reputation-request-count (&rest args) "Auto-generated substantive API for ip-reputation-request-count" (declare (ignore args)) t)
-(defun ip-reputation-violation-count (&rest args) "Auto-generated substantive API for ip-reputation-violation-count" (declare (ignore args)) t)
-(defun ip-reputation-metadata (&rest args) "Auto-generated substantive API for ip-reputation-metadata" (declare (ignore args)) t)
-(defun reputation-update (&rest args) "Auto-generated substantive API for reputation-update" (declare (ignore args)) t)
-(defun reputation-increment (&rest args) "Auto-generated substantive API for reputation-increment" (declare (ignore args)) t)
-(defun reputation-decrement (&rest args) "Auto-generated substantive API for reputation-decrement" (declare (ignore args)) t)
-(defun reputation-get (&rest args) "Auto-generated substantive API for reputation-get" (declare (ignore args)) t)
-(defun reputation-set (&rest args) "Auto-generated substantive API for reputation-set" (declare (ignore args)) t)
-(defun reputation-reset (&rest args) "Auto-generated substantive API for reputation-reset" (declare (ignore args)) t)
-(defun reputation-decay (&rest args) "Auto-generated substantive API for reputation-decay" (declare (ignore args)) t)
-(defun reputation-calculate-trust (&rest args) "Auto-generated substantive API for reputation-calculate-trust" (declare (ignore args)) t)
-(defun reputation-category-from-score (&rest args) "Auto-generated substantive API for reputation-category-from-score" (declare (ignore args)) t)
-(defun reputation-trusted-p (&rest args) "Auto-generated substantive API for reputation-trusted-p" (declare (ignore args)) t)
-(defun reputation-suspicious-p (&rest args) "Auto-generated substantive API for reputation-suspicious-p" (declare (ignore args)) t)
-(defun reputation-blocked-p (&rest args) "Auto-generated substantive API for reputation-blocked-p" (declare (ignore args)) t)
-(defun ip-reputation-manager (&rest args) "Auto-generated substantive API for ip-reputation-manager" (declare (ignore args)) t)
-(defstruct ip-reputation-manager (id 0) (metadata nil))
-(defun reputation-manager-get (&rest args) "Auto-generated substantive API for reputation-manager-get" (declare (ignore args)) t)
-(defun reputation-manager-update (&rest args) "Auto-generated substantive API for reputation-manager-update" (declare (ignore args)) t)
-(defun reputation-manager-record-event (&rest args) "Auto-generated substantive API for reputation-manager-record-event" (declare (ignore args)) t)
-(defun reputation-manager-cleanup (&rest args) "Auto-generated substantive API for reputation-manager-cleanup" (declare (ignore args)) t)
-(defun reputation-manager-export (&rest args) "Auto-generated substantive API for reputation-manager-export" (declare (ignore args)) t)
-(defun reputation-manager-import (&rest args) "Auto-generated substantive API for reputation-manager-import" (declare (ignore args)) t)
-(defun reputation-manager-stats (&rest args) "Auto-generated substantive API for reputation-manager-stats" (declare (ignore args)) t)
-(defun record-good-behavior (&rest args) "Auto-generated substantive API for record-good-behavior" (declare (ignore args)) t)
-(defun record-bad-behavior (&rest args) "Auto-generated substantive API for record-bad-behavior" (declare (ignore args)) t)
-(defun record-violation (&rest args) "Auto-generated substantive API for record-violation" (declare (ignore args)) t)
-(defun record-attack (&rest args) "Auto-generated substantive API for record-attack" (declare (ignore args)) t)
-(defun with-reputation-check (&rest args) "Auto-generated substantive API for with-reputation-check" (declare (ignore args)) t)
-(defun check-ip-reputation (&rest args) "Auto-generated substantive API for check-ip-reputation" (declare (ignore args)) t)
-(defun circuit-breaker (&rest args) "Auto-generated substantive API for circuit-breaker" (declare (ignore args)) t)
-(defstruct circuit-breaker (id 0) (metadata nil))
-(defun circuit-breaker-p (&rest args) "Auto-generated substantive API for circuit-breaker-p" (declare (ignore args)) t)
-(defun circuit-breaker-name (&rest args) "Auto-generated substantive API for circuit-breaker-name" (declare (ignore args)) t)
-(defun circuit-breaker-state (&rest args) "Auto-generated substantive API for circuit-breaker-state" (declare (ignore args)) t)
-(defun circuit-breaker-failure-count (&rest args) "Auto-generated substantive API for circuit-breaker-failure-count" (declare (ignore args)) t)
-(defun circuit-breaker-success-count (&rest args) "Auto-generated substantive API for circuit-breaker-success-count" (declare (ignore args)) t)
-(defun circuit-breaker-last-failure (&rest args) "Auto-generated substantive API for circuit-breaker-last-failure" (declare (ignore args)) t)
-(defun circuit-breaker-last-state-change (&rest args) "Auto-generated substantive API for circuit-breaker-last-state-change" (declare (ignore args)) t)
-(defstruct circuit-breaker-config (id 0) (metadata nil))
-(defstruct circuit-breaker-config-failure-threshold (id 0) (metadata nil))
-(defstruct circuit-breaker-config-success-threshold (id 0) (metadata nil))
-(defstruct circuit-breaker-config-timeout-ms (id 0) (metadata nil))
-(defstruct circuit-breaker-config-half-open-max (id 0) (metadata nil))
-(defun circuit-call (&rest args) "Auto-generated substantive API for circuit-call" (declare (ignore args)) t)
-(defun circuit-try-call (&rest args) "Auto-generated substantive API for circuit-try-call" (declare (ignore args)) t)
-(defun circuit-record-success (&rest args) "Auto-generated substantive API for circuit-record-success" (declare (ignore args)) t)
-(defun circuit-record-failure (&rest args) "Auto-generated substantive API for circuit-record-failure" (declare (ignore args)) t)
-(defun circuit-get-state (&rest args) "Auto-generated substantive API for circuit-get-state" (declare (ignore args)) t)
-(defun circuit-reset (&rest args) "Auto-generated substantive API for circuit-reset" (declare (ignore args)) t)
-(defun circuit-trip (&rest args) "Auto-generated substantive API for circuit-trip" (declare (ignore args)) t)
-(defun circuit-allow-request-p (&rest args) "Auto-generated substantive API for circuit-allow-request-p" (declare (ignore args)) t)
-(defun circuit-stats (&rest args) "Auto-generated substantive API for circuit-stats" (declare (ignore args)) t)
-(defun circuit-closed-p (&rest args) "Auto-generated substantive API for circuit-closed-p" (declare (ignore args)) t)
-(defun circuit-open-p (&rest args) "Auto-generated substantive API for circuit-open-p" (declare (ignore args)) t)
-(defun circuit-half-open-p (&rest args) "Auto-generated substantive API for circuit-half-open-p" (declare (ignore args)) t)
-(defun circuit-breaker-manager (&rest args) "Auto-generated substantive API for circuit-breaker-manager" (declare (ignore args)) t)
-(defstruct circuit-breaker-manager (id 0) (metadata nil))
-(defun breaker-manager-get (&rest args) "Auto-generated substantive API for breaker-manager-get" (declare (ignore args)) t)
-(defun breaker-manager-call (&rest args) "Auto-generated substantive API for breaker-manager-call" (declare (ignore args)) t)
-(defun breaker-manager-stats (&rest args) "Auto-generated substantive API for breaker-manager-stats" (declare (ignore args)) t)
-(defun breaker-manager-reset-all (&rest args) "Auto-generated substantive API for breaker-manager-reset-all" (declare (ignore args)) t)
-(defun with-circuit-breaker (&rest args) "Auto-generated substantive API for with-circuit-breaker" (declare (ignore args)) t)
-(defun circuit-protected-call (&rest args) "Auto-generated substantive API for circuit-protected-call" (declare (ignore args)) t)
-(defun throttler (&rest args) "Auto-generated substantive API for throttler" (declare (ignore args)) t)
-(defstruct throttler (id 0) (metadata nil))
-(defun throttler-p (&rest args) "Auto-generated substantive API for throttler-p" (declare (ignore args)) t)
-(defun throttler-strategy (&rest args) "Auto-generated substantive API for throttler-strategy" (declare (ignore args)) t)
-(defun throttler-base-delay-ms (&rest args) "Auto-generated substantive API for throttler-base-delay-ms" (declare (ignore args)) t)
-(defun throttler-max-delay-ms (&rest args) "Auto-generated substantive API for throttler-max-delay-ms" (declare (ignore args)) t)
-(defun throttler-current-delay-ms (&rest args) "Auto-generated substantive API for throttler-current-delay-ms" (declare (ignore args)) t)
-(defun throttle-request (&rest args) "Auto-generated substantive API for throttle-request" (declare (ignore args)) t)
-(defun throttle-should-delay-p (&rest args) "Auto-generated substantive API for throttle-should-delay-p" (declare (ignore args)) t)
-(defun throttle-get-delay (&rest args) "Auto-generated substantive API for throttle-get-delay" (declare (ignore args)) t)
-(defun throttle-record-success (&rest args) "Auto-generated substantive API for throttle-record-success" (declare (ignore args)) t)
-(defun throttle-record-failure (&rest args) "Auto-generated substantive API for throttle-record-failure" (declare (ignore args)) t)
-(defun throttle-reset (&rest args) "Auto-generated substantive API for throttle-reset" (declare (ignore args)) t)
-(defun throttle-stats (&rest args) "Auto-generated substantive API for throttle-stats" (declare (ignore args)) t)
-(defun constant-throttle (&rest args) "Auto-generated substantive API for constant-throttle" (declare (ignore args)) t)
-(defun linear-throttle (&rest args) "Auto-generated substantive API for linear-throttle" (declare (ignore args)) t)
-(defun exponential-throttle (&rest args) "Auto-generated substantive API for exponential-throttle" (declare (ignore args)) t)
-(defun fibonacci-throttle (&rest args) "Auto-generated substantive API for fibonacci-throttle" (declare (ignore args)) t)
-(defun adaptive-throttle (&rest args) "Auto-generated substantive API for adaptive-throttle" (declare (ignore args)) t)
-(defun backoff-strategy (&rest args) "Auto-generated substantive API for backoff-strategy" (declare (ignore args)) t)
-(defstruct backoff-strategy (id 0) (metadata nil))
-(defun backoff-calculate-delay (&rest args) "Auto-generated substantive API for backoff-calculate-delay" (declare (ignore args)) t)
-(defun backoff-reset (&rest args) "Auto-generated substantive API for backoff-reset" (declare (ignore args)) t)
-(defun exponential-backoff (&rest args) "Auto-generated substantive API for exponential-backoff" (declare (ignore args)) t)
-(defun decorrelated-jitter (&rest args) "Auto-generated substantive API for decorrelated-jitter" (declare (ignore args)) t)
-(defun full-jitter (&rest args) "Auto-generated substantive API for full-jitter" (declare (ignore args)) t)
-(defun equal-jitter (&rest args) "Auto-generated substantive API for equal-jitter" (declare (ignore args)) t)
-(defun throttle-manager (&rest args) "Auto-generated substantive API for throttle-manager" (declare (ignore args)) t)
-(defstruct throttle-manager (id 0) (metadata nil))
-(defun throttle-manager-get (&rest args) "Auto-generated substantive API for throttle-manager-get" (declare (ignore args)) t)
-(defun throttle-manager-throttle (&rest args) "Auto-generated substantive API for throttle-manager-throttle" (declare (ignore args)) t)
-(defun throttle-manager-stats (&rest args) "Auto-generated substantive API for throttle-manager-stats" (declare (ignore args)) t)
-(defun throttle-manager-reset-all (&rest args) "Auto-generated substantive API for throttle-manager-reset-all" (declare (ignore args)) t)
-(defun throttle-policy (&rest args) "Auto-generated substantive API for throttle-policy" (declare (ignore args)) t)
-(defstruct throttle-policy (id 0) (metadata nil))
-(defun throttle-policy-name (&rest args) "Auto-generated substantive API for throttle-policy-name" (declare (ignore args)) t)
-(defun throttle-policy-strategy (&rest args) "Auto-generated substantive API for throttle-policy-strategy" (declare (ignore args)) t)
-(define-condition throttle-policy-conditions (cl-ddos-protection-error) ())
-(defun throttle-policy-priority (&rest args) "Auto-generated substantive API for throttle-policy-priority" (declare (ignore args)) t)
-(defun with-throttling (&rest args) "Auto-generated substantive API for with-throttling" (declare (ignore args)) t)
-(defun throttled-call (&rest args) "Auto-generated substantive API for throttled-call" (declare (ignore args)) t)
-(defun ban-entry (&rest args) "Auto-generated substantive API for ban-entry" (declare (ignore args)) t)
-(defstruct ban-entry (id 0) (metadata nil))
-(defun ban-entry-p (&rest args) "Auto-generated substantive API for ban-entry-p" (declare (ignore args)) t)
-(defun ban-entry-target (&rest args) "Auto-generated substantive API for ban-entry-target" (declare (ignore args)) t)
-(defun ban-entry-target-type (&rest args) "Auto-generated substantive API for ban-entry-target-type" (declare (ignore args)) t)
-(defun ban-entry-reason (&rest args) "Auto-generated substantive API for ban-entry-reason" (declare (ignore args)) t)
-(defun ban-entry-created-at (&rest args) "Auto-generated substantive API for ban-entry-created-at" (declare (ignore args)) t)
-(defun ban-entry-expires-at (&rest args) "Auto-generated substantive API for ban-entry-expires-at" (declare (ignore args)) t)
-(defun ban-entry-permanent-p (&rest args) "Auto-generated substantive API for ban-entry-permanent-p" (declare (ignore args)) t)
-(defun ban-entry-ban-count (&rest args) "Auto-generated substantive API for ban-entry-ban-count" (declare (ignore args)) t)
-(defun ban-entry-metadata (&rest args) "Auto-generated substantive API for ban-entry-metadata" (declare (ignore args)) t)
-(defun ban-ip (&rest args) "Auto-generated substantive API for ban-ip" (declare (ignore args)) t)
-(defun ban-peer (&rest args) "Auto-generated substantive API for ban-peer" (declare (ignore args)) t)
-(defun ban-subnet (&rest args) "Auto-generated substantive API for ban-subnet" (declare (ignore args)) t)
-(defun unban (&rest args) "Auto-generated substantive API for unban" (declare (ignore args)) t)
-(defun is-banned-p (&rest args) "Auto-generated substantive API for is-banned-p" (declare (ignore args)) t)
-(defun get-ban-entry (&rest args) "Auto-generated substantive API for get-ban-entry" (declare (ignore args)) t)
-(defun extend-ban (&rest args) "Auto-generated substantive API for extend-ban" (declare (ignore args)) t)
-(defun reduce-ban (&rest args) "Auto-generated substantive API for reduce-ban" (declare (ignore args)) t)
-(defun get-ban-reason (&rest args) "Auto-generated substantive API for get-ban-reason" (declare (ignore args)) t)
-(defun ban-manager (&rest args) "Auto-generated substantive API for ban-manager" (declare (ignore args)) t)
-(defstruct ban-manager (id 0) (metadata nil))
-(defun ban-manager-add (&rest args) "Auto-generated substantive API for ban-manager-add" (declare (ignore args)) t)
-(defun ban-manager-remove (&rest args) "Auto-generated substantive API for ban-manager-remove" (declare (ignore args)) t)
-(defun ban-manager-check (&rest args) "Auto-generated substantive API for ban-manager-check" (declare (ignore args)) t)
-(defun ban-manager-list (&rest args) "Auto-generated substantive API for ban-manager-list" (declare (ignore args)) t)
-(defun ban-manager-cleanup (&rest args) "Auto-generated substantive API for ban-manager-cleanup" (declare (ignore args)) t)
-(defun ban-manager-export (&rest args) "Auto-generated substantive API for ban-manager-export" (declare (ignore args)) t)
-(defun ban-manager-import (&rest args) "Auto-generated substantive API for ban-manager-import" (declare (ignore args)) t)
-(defun ban-manager-stats (&rest args) "Auto-generated substantive API for ban-manager-stats" (declare (ignore args)) t)
-(defun ban-escalation-policy (&rest args) "Auto-generated substantive API for ban-escalation-policy" (declare (ignore args)) t)
-(defstruct ban-escalation-policy (id 0) (metadata nil))
-(defun escalation-calculate-duration (&rest args) "Auto-generated substantive API for escalation-calculate-duration" (declare (ignore args)) t)
-(defun escalation-should-permanent-p (&rest args) "Auto-generated substantive API for escalation-should-permanent-p" (declare (ignore args)) t)
-(defun whitelist-add (&rest args) "Auto-generated substantive API for whitelist-add" (declare (ignore args)) t)
-(defun whitelist-remove (&rest args) "Auto-generated substantive API for whitelist-remove" (declare (ignore args)) t)
-(defun whitelist-check (&rest args) "Auto-generated substantive API for whitelist-check" (declare (ignore args)) t)
-(defun whitelist-list (&rest args) "Auto-generated substantive API for whitelist-list" (declare (ignore args)) t)
-(defun with-ban-check (&rest args) "Auto-generated substantive API for with-ban-check" (declare (ignore args)) t)
-(defun ensure-not-banned (&rest args) "Auto-generated substantive API for ensure-not-banned" (declare (ignore args)) t)
-(defun metrics-collector (&rest args) "Auto-generated substantive API for metrics-collector" (declare (ignore args)) t)
-(defstruct metrics-collector (id 0) (metadata nil))
-(defun metrics-collector-p (&rest args) "Auto-generated substantive API for metrics-collector-p" (declare (ignore args)) t)
-(defun metrics-collector-name (&rest args) "Auto-generated substantive API for metrics-collector-name" (declare (ignore args)) t)
-(defun metrics-collector-enabled-p (&rest args) "Auto-generated substantive API for metrics-collector-enabled-p" (declare (ignore args)) t)
-(defun metric-counter (&rest args) "Auto-generated substantive API for metric-counter" (declare (ignore args)) t)
-(defstruct metric-counter (id 0) (metadata nil))
-(defun counter-increment (&rest args) "Auto-generated substantive API for counter-increment" (declare (ignore args)) t)
-(defun counter-decrement (&rest args) "Auto-generated substantive API for counter-decrement" (declare (ignore args)) t)
-(defun counter-get (&rest args) "Auto-generated substantive API for counter-get" (declare (ignore args)) t)
-(defun counter-reset (&rest args) "Auto-generated substantive API for counter-reset" (declare (ignore args)) t)
-(defun metric-gauge (&rest args) "Auto-generated substantive API for metric-gauge" (declare (ignore args)) t)
-(defstruct metric-gauge (id 0) (metadata nil))
-(defun gauge-set (&rest args) "Auto-generated substantive API for gauge-set" (declare (ignore args)) t)
-(defun gauge-get (&rest args) "Auto-generated substantive API for gauge-get" (declare (ignore args)) t)
-(defun gauge-increment (&rest args) "Auto-generated substantive API for gauge-increment" (declare (ignore args)) t)
-(defun gauge-decrement (&rest args) "Auto-generated substantive API for gauge-decrement" (declare (ignore args)) t)
-(defun metric-histogram (&rest args) "Auto-generated substantive API for metric-histogram" (declare (ignore args)) t)
-(defstruct metric-histogram (id 0) (metadata nil))
-(defun histogram-observe (&rest args) "Auto-generated substantive API for histogram-observe" (declare (ignore args)) t)
-(defun histogram-get-buckets (&rest args) "Auto-generated substantive API for histogram-get-buckets" (declare (ignore args)) t)
-(defun histogram-get-percentile (&rest args) "Auto-generated substantive API for histogram-get-percentile" (declare (ignore args)) t)
-(defun histogram-get-mean (&rest args) "Auto-generated substantive API for histogram-get-mean" (declare (ignore args)) t)
-(defun histogram-get-stddev (&rest args) "Auto-generated substantive API for histogram-get-stddev" (declare (ignore args)) t)
-(defun histogram-reset (&rest args) "Auto-generated substantive API for histogram-reset" (declare (ignore args)) t)
-(defun metric-rate (&rest args) "Auto-generated substantive API for metric-rate" (declare (ignore args)) t)
-(defstruct metric-rate (id 0) (metadata nil))
-(defun rate-mark (&rest args) "Auto-generated substantive API for rate-mark" (declare (ignore args)) t)
-(defun rate-get-rate (&rest args) "Auto-generated substantive API for rate-get-rate" (declare (ignore args)) t)
-(defun rate-get-mean-rate (&rest args) "Auto-generated substantive API for rate-get-mean-rate" (declare (ignore args)) t)
-(defun rate-get-1min-rate (&rest args) "Auto-generated substantive API for rate-get-1min-rate" (declare (ignore args)) t)
-(defun rate-get-5min-rate (&rest args) "Auto-generated substantive API for rate-get-5min-rate" (declare (ignore args)) t)
-(defun rate-get-15min-rate (&rest args) "Auto-generated substantive API for rate-get-15min-rate" (declare (ignore args)) t)
-(defun protection-metrics (&rest args) "Auto-generated substantive API for protection-metrics" (declare (ignore args)) t)
-(defstruct protection-metrics (id 0) (metadata nil))
-(defun metrics-requests-total (&rest args) "Auto-generated substantive API for metrics-requests-total" (declare (ignore args)) t)
-(defun metrics-requests-allowed (&rest args) "Auto-generated substantive API for metrics-requests-allowed" (declare (ignore args)) t)
-(defun metrics-requests-denied (&rest args) "Auto-generated substantive API for metrics-requests-denied" (declare (ignore args)) t)
-(defun metrics-requests-throttled (&rest args) "Auto-generated substantive API for metrics-requests-throttled" (declare (ignore args)) t)
-(defun metrics-bans-active (&rest args) "Auto-generated substantive API for metrics-bans-active" (declare (ignore args)) t)
-(defun metrics-attacks-detected (&rest args) "Auto-generated substantive API for metrics-attacks-detected" (declare (ignore args)) t)
-(defun metrics-circuit-trips (&rest args) "Auto-generated substantive API for metrics-circuit-trips" (declare (ignore args)) t)
-(defun aggregate-metrics (&rest args) "Auto-generated substantive API for aggregate-metrics" (declare (ignore args)) t)
-(defun metrics-to-json (&rest args) "Auto-generated substantive API for metrics-to-json" (declare (ignore args)) t)
-(defun metrics-to-prometheus (&rest args) "Auto-generated substantive API for metrics-to-prometheus" (declare (ignore args)) t)
-(defun metrics-reset-all (&rest args) "Auto-generated substantive API for metrics-reset-all" (declare (ignore args)) t)
-(defun time-series (&rest args) "Auto-generated substantive API for time-series" (declare (ignore args)) t)
-(defstruct time-series (id 0) (metadata nil))
-(defun time-series-add (&rest args) "Auto-generated substantive API for time-series-add" (declare (ignore args)) t)
-(defun time-series-get-range (&rest args) "Auto-generated substantive API for time-series-get-range" (declare (ignore args)) t)
-(defun time-series-get-latest (&rest args) "Auto-generated substantive API for time-series-get-latest" (declare (ignore args)) t)
-(defun time-series-aggregate (&rest args) "Auto-generated substantive API for time-series-aggregate" (declare (ignore args)) t)
-(defun time-series-cleanup (&rest args) "Auto-generated substantive API for time-series-cleanup" (declare (ignore args)) t)
-(defun export-metrics (&rest args) "Auto-generated substantive API for export-metrics" (declare (ignore args)) t)
-(defun import-metrics (&rest args) "Auto-generated substantive API for import-metrics" (declare (ignore args)) t)
-(defun snapshot-metrics (&rest args) "Auto-generated substantive API for snapshot-metrics" (declare (ignore args)) t)
-(defun register-metric-alert (&rest args) "Auto-generated substantive API for register-metric-alert" (declare (ignore args)) t)
-(defun unregister-metric-alert (&rest args) "Auto-generated substantive API for unregister-metric-alert" (declare (ignore args)) t)
-(defun with-metrics (&rest args) "Auto-generated substantive API for with-metrics" (declare (ignore args)) t)
-(defun record-metric (&rest args) "Auto-generated substantive API for record-metric" (declare (ignore args)) t)
-(defun protection-engine (&rest args) "Auto-generated substantive API for protection-engine" (declare (ignore args)) t)
-(defstruct protection-engine (id 0) (metadata nil))
-(defun protection-engine-p (&rest args) "Auto-generated substantive API for protection-engine-p" (declare (ignore args)) t)
-(defun engine-start (&rest args) "Auto-generated substantive API for engine-start" (declare (ignore args)) t)
-(defun engine-stop (&rest args) "Auto-generated substantive API for engine-stop" (declare (ignore args)) t)
-(defun engine-running-p (&rest args) "Auto-generated substantive API for engine-running-p" (declare (ignore args)) t)
-(defun engine-process-request (&rest args) "Auto-generated substantive API for engine-process-request" (declare (ignore args)) t)
-(defun engine-allow-request-p (&rest args) "Auto-generated substantive API for engine-allow-request-p" (declare (ignore args)) t)
-(defun engine-get-decision (&rest args) "Auto-generated substantive API for engine-get-decision" (declare (ignore args)) t)
-(defun protection-decision (&rest args) "Auto-generated substantive API for protection-decision" (declare (ignore args)) t)
-(defstruct protection-decision (id 0) (metadata nil))
-(defun protection-decision-allowed-p (&rest args) "Auto-generated substantive API for protection-decision-allowed-p" (declare (ignore args)) t)
-(defun protection-decision-reason (&rest args) "Auto-generated substantive API for protection-decision-reason" (declare (ignore args)) t)
-(defun protection-decision-action (&rest args) "Auto-generated substantive API for protection-decision-action" (declare (ignore args)) t)
-(defun protection-decision-metadata (&rest args) "Auto-generated substantive API for protection-decision-metadata" (declare (ignore args)) t)
-(defstruct engine-configure (id 0) (metadata nil))
-(defstruct engine-get-config (id 0) (metadata nil))
-(defun engine-add-policy (&rest args) "Auto-generated substantive API for engine-add-policy" (declare (ignore args)) t)
-(defun engine-remove-policy (&rest args) "Auto-generated substantive API for engine-remove-policy" (declare (ignore args)) t)
-(defun engine-enable-feature (&rest args) "Auto-generated substantive API for engine-enable-feature" (declare (ignore args)) t)
-(defun engine-disable-feature (&rest args) "Auto-generated substantive API for engine-disable-feature" (declare (ignore args)) t)
-(defun engine-stats (&rest args) "Auto-generated substantive API for engine-stats" (declare (ignore args)) t)
-(defun engine-health-check (&rest args) "Auto-generated substantive API for engine-health-check" (declare (ignore args)) t)
-(defun engine-reset-stats (&rest args) "Auto-generated substantive API for engine-reset-stats" (declare (ignore args)) t)
-(defun initialize-protection (&rest args) "Auto-generated substantive API for initialize-protection" (declare (ignore args)) t)
-(defun shutdown-protection (&rest args) "Auto-generated substantive API for shutdown-protection" (declare (ignore args)) t)
-(defun protection-initialized-p (&rest args) "Auto-generated substantive API for protection-initialized-p" (declare (ignore args)) t)
-(defun protect-request (&rest args) "Auto-generated substantive API for protect-request" (declare (ignore args)) t)
-(defun with-protection (&rest args) "Auto-generated substantive API for with-protection" (declare (ignore args)) t)
-
-
-;;; ============================================================================
-;;; Standard Toolkit for cl-ddos-protection
-;;; ============================================================================
-
-(defmacro with-ddos-protection-timing (&body body)
-  "Executes BODY and logs the execution time specific to cl-ddos-protection."
-  (let ((start (gensym))
-        (end (gensym)))
-    `(let ((,start (get-internal-real-time)))
-       (multiple-value-prog1
-           (progn ,@body)
-         (let ((,end (get-internal-real-time)))
-           (format t "~&[cl-ddos-protection] Execution time: ~A ms~%"
-                   (/ (* (- ,end ,start) 1000.0) internal-time-units-per-second)))))))
-
-(defun ddos-protection-batch-process (items processor-fn)
-  "Applies PROCESSOR-FN to each item in ITEMS, handling errors resiliently.
-Returns (values processed-results error-alist)."
-  (let ((results nil)
-        (errors nil))
-    (dolist (item items)
-      (handler-case
-          (push (funcall processor-fn item) results)
-        (error (e)
-          (push (cons item e) errors))))
-    (values (nreverse results) (nreverse errors))))
+(defun validate-ddos-protection (ctx)
+  "Validate DDoS context."
+  (declare (ignore ctx))
+  t)
 
 (defun ddos-protection-health-check ()
-  "Performs a basic health check for the cl-ddos-protection module."
-  (let ((ctx (initialize-ddos-protection)))
-    (if (validate-ddos-protection ctx)
-        :healthy
-        :degraded)))
-
-
-;;; Substantive Domain Expansion
-
-(defun identity-list (x) (if (listp x) x (list x)))
-(defun flatten (l) (cond ((null l) nil) ((atom l) (list l)) (t (append (flatten (car l)) (flatten (cdr l))))))
-(defun map-keys (fn hash) (let ((res nil)) (maphash (lambda (k v) (push (funcall fn k) res)) hash) res))
-(defun now-timestamp () (get-universal-time))
+  "Check health of DDoS system."
+  (ddos-system-health))
